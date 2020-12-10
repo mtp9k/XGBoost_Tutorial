@@ -1,0 +1,833 @@
+---
+title: "XGBoost Tutorial"
+author: "Buckley Dowdle,Congxin (David) Xu, Stephen Morris, Michael Pajewski "
+date: "12/2/2020"
+output: html_document
+---
+
+*******************************************
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(error = TRUE,        # Keep compiling upon error
+                      collapse = FALSE,    # collapse by default
+                      echo = TRUE,         # echo code by default
+                      comment = "#>",      # change comment character
+                      fig.width = 5,       # set figure width
+                      fig.align = "center",# set figure position
+                      out.width = "49%",   # set width of displayed images
+                      warning = TRUE,      # show R warnings
+                      message = TRUE)      # show R messages
+options(dplyr.summarise.inform = FALSE)   # ignore message about group structure
+
+library(xgboost)
+library(data.table)
+require(Matrix)
+library(caret)
+library(gtsummary)
+library(tidyverse)
+library(ParBayesianOptimization)
+library(rpart)
+```
+
+# **Introduction**
+
+**XGBoost** stands for *“Extreme Gradient Boosting”*, and is among the newest and most popular methods in machine learning, well-suited for tasks including prediction, classification, and regression. XGBoost is extremely effective, routinely contributing to contest wins through [Kaggle](https://www.kaggle.com/) and other hosts. It was developed in 2016 by **Tianqi Chen** and **Carlos Guestrin**, both of the University of Washington, and their release paper can be found [here](https://arxiv.org/pdf/1603.02754.pdf) [1]. Through this tutorial, we will briefly describe what XGBoost is and show how it can be employed for multiple tasks and tuned for optimum performance. For further detail, check out the [XGBoost Documentation](https://xgboost.readthedocs.io/en/latest/index.html), which we referenced to create this brief tutorial. We also credit chapter 10 in [The Elements of Statistical Learning](https://web.stanford.edu/~hastie/Papers/ESLII.pdf) [2], and class notes from [SYS 6018 Data Mining](https://mdporter.github.io/SYS6018/index.html), Professor Michael Porter, University of Virginia School of Data Science [3].
+
+## A brief tree refresher
+
+Just to make sure our terminology is easily understood, see the following example of a simple decision tree. These can be used for regression or classification:
+
+![](tree_sample.JPG)
+
+The **root node** represents the total data set, and the first split is the first decision to partition the data based on some criteria. This results in two subsequent or **child nodes**. Common examples might be income above or below a certain threshold, does a person like coffee or not, etc. Then each subsequent decision node may have another criteria to split on. We almost always stick to binary splits to prevent excessive complexity. Once a node either has only 1 data point, or we've reached the threshold at which to stop, this node is a **leaf node** or **terminal node**. This example has a **depth**$=4$, counting levels down from the root node. A **depth**=$1$ would include nodes **B** and $1$; **Depth**=$2$ would include nodes $2$ and **C**, and so on. Note that since leaf node $1$ resulted from a split from the root, and has no child nodes of its own, it is called a **stump**. The deeper a tree is grown, the more complex the model becomes as we fit to more and finer parameters on the data set, creating a high variance. By contrast, a tree which is more shallow and wide will tend to be more balanced and have a higher bias. If we end up with a tree that is deeper and more complex than we want, we can reverse the growing process with a technique known as **pruning** which reverses splits. If we pruned the tree above to a **maximum depth**$=3$, leaf nodes $4$ and $5$ would be re-absorbed into what is currently decision node **D**. Decision node **D**, containing all of the data points previously in nodes $4$ and $5$, would then be simply a leaf node, since no further splits would result from it.
+
+The plot below is a simple implementation in **R** using the **rpart** package and the included **Kyphosis** data set, which represents children who have had corrective spinal surgery. This is adapted from the [rpart documentation](https://www.rdocumentation.org/packages/rpart/versions/4.1-15/topics/kyphosis) [4]. In this example, the decision nodes split into child nodes based on criteria from the ```Start``` (the number of the first vertebra operated on), ```Number``` (the total number of vertebrae involved in the procedure), or ```Age``` (child's age in months) features, and the response of ```Kyphosis``` indicates whether they kyphosis spinal deformation was either absent or present following the operation. This information could help surgeons and researchers determine when and how to conduct these spinal operations to achieve the optimum success for patients.
+```{r}
+tree = rpart(Kyphosis ~ Age + Number + Start, data = kyphosis)
+plot(tree)
+text(tree, use.n = TRUE, cex = .7)
+```
+
+The simple example above reflects the fitting of a single tree model for classification. On a very simple data set, this may be sufficient for some problems. However, most data sets and machine learning problems will be large and complex, and need more advanced techniques to efficiency and accurately solve. Now we will move on to describing the sequential ensemble technique known as boosting.
+
+## What is boosting?
+
+Boosting is a powerful and popular method in machine learning. It is used in supervised learning, meaning we use observations, typically from multiple variables in training data $x$ to predict a response variable $y$. It can be used in classification or regression tasks, and is most often employed with tree model methodologies. Boosting is similar to other **ensemble** methods, but is a more specific type of ensemble. Ensemble models combine multiple ‘base learner’ models, including different types or variations of models, seeking to come up with a reasonable approximation of a true unknown model form. Ensembles have an advantage over a single model fit because they reduce the chances of over- or under- fitting to certain points in the data set. Some models will predict better than others on certain sub-sets of the data, and with ensembles we can take advantage of this while mitigating the inherent shortcomings of each model. This is a case where the resulting whole is proverbially greater than the sum of its parts. Ensembles can be created in several different ways, and we briefly define a few here:
+
+* **Bagging** – this method utilizes bootstrapping samples of the same base model, most often a tree, and averaging the predictions from each time the base model is fitted. This process reduces variance in the model, which will help to prevent overfitting to a specific training data set. One well-known example of bagging is Random Forest, a popular module in the R library. For more information on bagging and Random Forest, read here (insert hyperlink).
+* **Model Averaging** – fit multiple, distinct models to the same training data set, and average the prediction results using one of several methods, including a simple mean. 
+* **Stacking** – Model averaging can be extended to weight certain models more heavily than others based on their respective error or loss, measured by methods such as BIC or AIC. This weighted averaging is called stacking. This has an advantage over simple averaging because better-performing models will have a greater influence on the resulting ensemble than weaker performers.
+
+Each of the ensemble methods defined above are variations of **parallel** ensembling. Each sub-model, called a **base learner**, is fitted independently of the other base learners in the ensemble, then the resulting predictions are combined in one of several ways at the end. The results of one base learner does not impact the fitting of another. Each model only has an independent influence on the final model at the completion of the ensemble.
+
+Boosting is different from parallel ensembling because it is a **sequential** ensemble method. Rather than fitting a number of base learner models independently of one another and combining them at the end, a sequential ensemble builds each model dependently on the models fitted previously. The goal in this case is to optimize (minimize) bias with each iteration of re-fitting. This is different than bagging discussed earlier which optimizes variance instead. With each step, we minimize according to a selected loss function for the current model and refit until we reach a pre-defined threshold.
+
+Boosting generally fits simple models, such as shallow trees. The principle is to grow our trees “low and slow,” meaning that we want shallow trees, which will have a low **variance** and high **bias**, then with each step of refitting, we minimize the bias. It is important to set a stopping point for this methodology, as it can easily begin to overfit with increasing iterations. We will set a threshold on which to stop to avoid this. We may have to re-fit our ensemble many, many times to achieve the desired gradual growth before reaching our optimum objective.
+
+## How does XGBoost work?
+
+XGBoost is a type of **gradient boosting**. This differs from the other main type of boosting, AdaBoost. AdaBoost fits each sequential base learner (model) to weighted **observations**. This causes the weights for each base learner to depend on how well or how poorly the model predicts on the observations or x-values in the data set. This method is specifically designed for binary classification. Gradient boosting, however, fits base learners based on the **residuals** from the previous model’s predictions. These residuals are the negative gradients of the loss function. This process is commonly known as **gradient descent**, reducing the gradient of the loss function with each sequential step until it is optimized. To put it another way, each base learner model fitted is an estimate of the negative derivative of the loss function. Gradient boosting works well on classification but can be effectively applied to regression as well.
+
+In boosting, our basic objective is to minimize *training loss*, without overfitting. To accomplish this, we have to incorporate a penalty for model complexity, called a *regularization term*, along with the loss function of our choosing. Minimizing loss increases variance while minimizing complexity increases bias. The function below defines our objective in basic terms:
+
+$$
+obj^{(t)} = \Sigma_{i=1}^{n}l(y_i,\hat y_i^{(t)})+\Sigma_{i=1}^{t}\Omega(f_i)
+$$
+The left hand side (LHS) of this equation incorporates the loss function, while the right hand side (RHS) defines the complexity. We want to minimize the sum of these two components, and this boils down to the ever-present bias-variance tradeoff common to machine learning problems. $t$ represents each step of (base learner, usually tree) model fitting in our sequential ensemble, and $n$ is the total number of models to be fit. $f_i$ is each function of the trees containing the model parameters. $y_i$ represent the true response values, while $\hat y_i^{(t)}$ is predicted response values for the model at step $t$. $\Omega$ is the regularization term or penalty for complexity.
+
+If we use mean squared error (MSE) for the loss function, as is often done, the objective will look like this:
+
+$$
+obj^{(t)} = \Sigma_{i=1}^{n}l(y_i - (\hat y_i^{(t-1)} + f_t(x_i)))^2+\Sigma_{i=1}^{t}\Omega(f_i)
+$$
+where $f_t(x_i)$ is the function at step $t$ based on the observations or features $x_i$.
+
+Gradient boosting focuses weight towards observations that are poorly predicted, as indicated by larger residuals at a given step. Less attention is given to observations where a previous base learner model has already predicted well, and more is given to those where an accurate prediction has not yet been made.
+
+XGBoost is faster in implementation than previous gradient boosting methods, and employs a **2nd-order gradient descent**, which is called the *Taylor expansion*. The 1st-order gradient descent includes the gradient loss function, which generally uses mean squared error (MSE) as the loss function as described above. If we want to use an alternative loss function, such as logistic loss, the Taylor expansion can be employed, which includes both the **gradient loss**, here referred to as $g_i$ and the addition of **hessian loss** $h_i$. These two loss functions are defined by the derivative equations below:
+
+$$
+g_i = \partial_{\hat y_i^{(t-1)}}l(y_i, (\hat y_i^{(t-1)})\\
+h_i= \partial^2_{\hat y_i^{(t-1)}}l(y_i, (\hat y_i^{(t-1)})
+$$
+As we can see, the **hessian** represents the **second order** loss function, with the only difference being $\partial^2$ compared to $\partial$ in the gradient loss. By summing these two loss functions and substituting the **LHS** in our original objective, we can define the objective at step $t$ as:
+
+$$
+obj^{(t)} = \Sigma_{i=1}^{n}[g_if_t(x_i)+\frac{1}{2}h_if_t^2(x_i)]+\Omega(f_i)
+$$
+
+## Implementation in R
+
+XGBoost is employed in multiple popular language platforms, including **Python**, **Ruby**, **Julia** and others. In this tutorial, we will focus on **R** implementation. In this case, we will need to install the **```xgboost```** package as described below. The **```caret```** package [5] is also going to be very helpful, but we'll describe that as we go.
+
+### Tuning Parameters
+
+XGBoost is very powerful, and can be tuned with a few parameters. We will introduce these parameters here, and fully explain how to employ them later in the tutorial.
+
+* **```max_depth```** controls the maximum depth of the tree. We want to grow our trees low to increase bias, so this number will also generally be low, often between $1$ and $10$, with $6$ being the default. A ```max_depth = 1``` would limit the trees to only stumps, so the range for this parameter can be $[1,\infty]$.
+* **```min_child_weight```** limits the minimum value of child node weight in our trees. This is a threshold to stop partitioning the tree model. This can range from $[0, \infty]$.
+* **```gamma```** although not explicitly shown in the formulas above, this is the tuning parameter within the regularization term $\Omega(f_i)$. The larger ```gamma``` is, the greater the penalty, resulting in a more conservative growth of trees. The range is $[0, \infty]$.
+* **```eta```** controls the *shrinkage* or feature weights, effectively the sizes of the steps $t$. As stated earlier, we want to grow our trees slowly to prevent excessive variance and overfitting, so this parameter should generally be kept low. The acceptable range is $[0,1]$.
+* **```nrounds```** controls the number of passes, or boosting iterations to take on the data set. Multiples will increase the precision of the model predictions.
+* **```subsample```** is the subsample ratio of the training data. The range is $[0,1]$, with a default of $1$, meaning that all of the training data would be sampled for each boosting iteration or pass (see ```nrounds``` above). Setting this to $0.5$ for example would limit XGBoost to randomly sampling only half of the training data, helping to mitigate overfitting.
+* **```colsample_bytree```** is the subsample ratio of columns when growing each tree. The range is also $[0,1]$, with a default of $1$, specifying the fraction of columns to be sampled each time. We could also subsample columns by level or node using ```colsample_bylevel``` or ```colsample_bynode```. 
+* **```nthread```** will not affect the precision of the model, but can speed up our processing. This specifies the number of CPU threads to use.
+
+
+# **Tutorial: Classification** 
+The purpose of this tutorial is to show you how to use XGBoost to build a model and make binary classification predictions. 
+This tutorial assumes you have working knowledge of R code and have and have R downloaded on your system. 
+
+### Installation
+The XGBoost package can be install through CRAN. The current version of XGBoost 0.4-2 can be installed by:
+
+```{r, eval = FALSE}
+install.packages("xgboost")
+```
+
+The `caret` package (short for Classification And Regression Training) helps to streamline the process for creating predictive models. We will also later use the `caret` package to split the data. If you do not already have it, you can install it by running this line:
+
+```{r, eval = FALSE}
+install.packages("caret")
+```
+
+Then, load the packages required for this tutorial 
+
+```{r, message=FALSE, warning = FALSE}
+library(xgboost)
+library(caret)
+```
+
+### Preparation of Data for using XGBoost
+In this tutorial, we will be using the diabetes classification data set from the following closed Kaggle competition. The goal of this competition is to predict if the given patients are suffering from diabetes.
+
+### Download Data
+Download the data set [here](https://www.kaggle.com/c/diabetes-classification/data) and save the 3 files to the same directory you have your R file saved to.
+
+The data is split into 3 files:
+
+1. train.csv
+    + The full data we will use to train the model and test its accuracy  
+2. test.csv 
+    + The file we will test our final model on to produce predictions for the competition
+3. sample_submission.csv 
+    + A sample of how to submit predictions to the competition 
+  
+First import your data into R
+```{r}
+full_data = read.csv("train.csv")
+submission_test = read.csv("test.csv")
+```
+
+### Data Cleaning and Feature Engineering 
+
+We will not do any feature engineering on this data set, but feature engineering can significantly improve model prediction in some datasets. If you plan to use XGBoost on a data set that contains categorical features, you should consider feature engineering like one-hot encoding. If your data set contains ```NA``` XGBoost can automatically handle them in but some cases it still may be better to manually deal with NA values.
+
+### Split data into Train and Test
+We will now need to split our full_data data into a train-test data sets. We split the data sets into train and test, so we can build a model with the training data and test the model accuracy with the testing data. 
+
+We will use the caret package `createDataPartition` function to split the data into a 80% training data and 20% testing data. We will also split the class labels and predictors into separate variables.
+
+* The `y` argument is set to the data sets prediction. In the case, 1 for having and 0 for not having diabetes
+* The `p` argument sets the percent to split 
+* The list argument set to False prevents the index being returned as a list
+
+```{r}
+# Randomness Control
+set.seed(1212) 
+
+# Train-Test Split
+inTrain = createDataPartition(y = full_data$diabetes, p = 0.8, list = FALSE)
+
+# Training Data
+train =  as.matrix(full_data[inTrain, ])
+train_x = train[, 2:9]
+train_y = train[, 10, drop = FALSE]
+
+# Testing Data
+test = as.matrix(full_data[-inTrain, ])
+test_x = test[, 2:9]
+test_y = test[, 10, drop = FALSE]
+```
+
+### Convert data frame to DMatrix 
+The final data preparation step is to convert the data frames to DMatrix object. This will help the model to train more quickly and in more complex implementations allow for training on multiple cores.
+
+```{r}
+dtrain = xgb.DMatrix(data = train_x, label= train_y)
+dtest = xgb.DMatrix(data = test_x, label= test_y)
+```
+
+### Basic Training model 
+We will train the model with the following parameters:
+
+- `objective = "binary:logistic"` : we will train a binary classification model;
+- `max_depth = 2`: the trees won’t be deep, because our case is very simple;
+- `nthread = 2`: the number of CPU threads we are going to use;
+- `nrounds = 2` : there will be two boosting iterations on the data, the second one will enhance the model by further reducing the difference between ground truth and prediction.
+
+We will discuss more on how to tune the parameters later in the Hyperparameter Tuning section.
+```{r}
+model = xgboost(data = dtrain, 
+                max_depth = 2,
+                eta = 1,
+                nthread = 2,
+                nrounds = 2,
+                objective = "binary:logistic")
+```
+
+### Feature Importance
+An importance matrix can be generated to identify the most important factors on if a person will develop diabetes. Looking at the importance matrix we can see "Glucose concentration", "BMI", "age", and "diabetes pedigree" are the most important features in the dataset.
+
+```{r}
+# Importance Matrix
+importance_matrix = xgb.importance(model = model)
+xgb.plot.importance(importance_matrix = importance_matrix)
+```
+
+### Creating Predictions
+We use the model built on the training data to create predictions on the test data. We can see from the first 10 predictions of the data set we have only created probabilities and we will later transform these to binary  predictions 
+
+```{r}
+# Make Predictions
+pred = predict(model, dtest)
+
+# Display the first 10 predictions
+head(pred,10)
+```
+
+### Creating Binary Classifications
+
+XGBoost does not create binary classifications it  creates probability predictions. In the case the predictions are probabilities that a person in the data set will be classified as 1 having diabetes. We can create binary classifications by setting a boundary where the probability is > 0.5 these observations are classified as 1 having diabetes and =< .5 as 0 not having diabetes. We use `as.numeric(pred > 0.5)` to change the probabilities to 0-1 classifications. Now looking at the first 10 predictions, we have binary classifications. 
+
+```{r}
+# Hard Classification
+predictions = as.numeric(pred > 0.5)
+
+# Display the first 10 predictions
+head(predictions, 10)
+```
+
+### Reporting Accuracy 
+We use the `confusionMatrix()` function from the `caret` package to calculate a cross-tabulation (confusion matrix) of observed and predicted classes and show associated statistics.   
+
+```{r}
+# Confusion matrix
+test_y = as.factor(test_y)
+predictions = as.factor(predictions)
+confusionMatrix(predictions, test_y, positive = "1")
+```
+
+Looking at the output, we have a good accuracy of $76.23\%$. Looking at the specificity of $94.81\%$ our model is very accurate at classifying those in the test set that do not have diabetes as not having diabetes. Looking at the sensitivity of 44.44% our model is only marginally accurate at classifying those who have diabetes as having diabetes. 
+
+### Making Predictions for the Kaggle Competition
+
+The Kaggle competition is closed but we can still submit our predictions and receive a score to see how we stack up against others. Here we re-train the model on all the data then make predictions on the Kaggle test set. 
+
+```{r}
+# Create xgb.DMatrix of full data
+full_x = as.matrix(full_data[, 2:9])
+full_y = as.matrix(full_data[, 10, drop = FALSE])
+dfull = xgb.DMatrix(data = full_x, label = full_y)
+
+# Re-train model
+model2 = xgboost(
+  data = dfull,
+  max_depth = 2,
+  eta = 1,
+  nthread = 2,
+  nrounds = 2,
+  objective = "binary:logistic"
+)
+
+
+# Subset the submission test set to only the predictors
+submission_data = as.matrix(submission_test[, 2:9])
+
+# Create predictions using out model on the submission test data
+Kaggel_pred = predict(model2, submission_data)
+Kaggel_predictions = as.numeric(Kaggel_pred > 0.5)
+
+
+# Bind the column of the subject ID and our prediction
+submission = cbind(submission_test[, 1] , Kaggel_predictions)
+colnames(submission) = c('p_id', 'diabetes')
+
+# Write the predictions to the submission.csv file
+write.csv(submission, 'submission.csv', row.names = FALSE)
+```
+
+If you follow this tutorial will receive a sore of $0.71428$. The submission csv file can be submitted here https://www.kaggle.com/c/diabetes-classification/submit
+
+# **Tutorial: Regression**
+
+Next, we will demonstrate how to implement an XGBoost model to solve a regression type of problem and show how the tuning parameters affect the performance of the model. For demonstration purposes, we will use the "Energy efficiency Data Set" available from the [UCI Machine Learning Repository here.](https://archive.ics.uci.edu/ml/datasets/Energy+efficiency) This data set contains eight attributes describing 768 buildings that we will use to predict one of the two response variables, the cooling load.
+
+### Data Prep and Abbreviated Exploration
+First, we will load the data and ensure the categorical attributes are factors. Next, we convert the data to a matrix with one-hot-encoding for the categorical features. Then, we will look at the minimum, maximum, and median values as well as the mean and standard deviation of the attributes.
+
+```{r}
+# Load data from CSV
+data1 <- read_csv('energy_data.csv')
+
+# Ensure X8 and X6 are factors
+data1$X8 <- as.factor(data1$X8)
+data1$X6 <- as.factor(data1$X6)
+
+
+# Create dummy variables
+dummies <- dummyVars( ~ ., data = data1)
+data2 <- predict(dummies, newdata = data1)
+
+
+# Create Training Partition
+inTrain <- createDataPartition(y = data1$Y1, p = 0.8, list = FALSE)
+
+# Training data
+train <-  data2[inTrain, ]
+
+# Testing Data
+test_x <-  data2[-inTrain, 1:16]
+test_y <-  data2[-inTrain, 17, drop = FALSE]
+
+# Briefly explore data grouped by categorical features
+data1 %>% tbl_summary(
+  by = X8,
+  type = list(
+    X1 ~ "continuous2",
+    X2 ~ "continuous2",
+    X3 ~ "continuous2",
+    X4 ~ "continuous2",
+    X7 ~ "continuous2",
+    Y1 ~ "continuous2"
+  ),
+  statistic = all_continuous() ~
+    c("{min}, {median}, {max}",
+      "{mean} ({sd})")
+)
+
+data1 %>% tbl_summary(
+  by = X6,
+  type = list(
+    X1 ~ "continuous2",
+    X2 ~ "continuous2",
+    X3 ~ "continuous2",
+    X4 ~ "continuous2",
+    X7 ~ "continuous2",
+    Y1 ~ "continuous2"
+  ),
+  statistic = all_continuous() ~
+    c("{min}, {median}, {max}",
+      "{mean} ({sd})")
+)
+```
+
+
+### Model Fitting
+
+Now that we have some sense of the data and have converted categorical features to binary features using one hot encoding, we can begin to fit our model. Since we have already shown how to fit a model using just the XGBoost package, we will now use the `caret` package, which contains a number of useful features that we will highlight. Implementing models with `caret` allows one to learn only one set of syntax and documentation while being able to implement dozens of different machine learning algorithms. 
+
+- The first feature to highlight is the `trainControl` feature. This allows for the easy implementation of sampling techniques such as leave one out or k fold cross validation and allow parallel computing.
+- Next is the tuning grid which allows one to set the parameters of the model itself. Later we will discuss how to use this feature to find the optimal tuning parameters in more detail.
+- Fitting the model is done using the `train` function. Within the function, we specify the response and predictor variables, the data to use, the method, and the loss function.
+
+
+```{r, warning=FALSE}
+
+# First we set the control parameters
+control <- trainControl(method = "repeatedcv",      # Sampling method - repeated cross validation
+                        number = 10,                # 10 folds of the data
+                        repeats = 3,                # 3 iterations of cross validation
+                        allowParallel = TRUE)       # allow parallel computing
+
+# Set the model parameters
+default_params <- expand.grid(nrounds = 100,        # Boosting Iterations
+                              max_depth = 6,        # max depth of the tree
+                              eta = 0.3,            # Shrinkage factor
+                              gamma = 0,            # Minimum loss reduction on a leaf node
+                              colsample_bytree = 1, # The percentage of columns to sample 
+                              min_child_weight = 1, # Minimum value of child weight
+                              subsample = 1)        # The amount of the data to sample to prior to fitting
+                                              
+
+# Train the model
+model1 <- train(Y1 ~ .,                         # Formula setting Y1 as the response and all other columns as the predictors
+                data = train,                   # Use the training data to fit the model
+                trControl = control,            # Set the training controls to those created earlier
+                tuneGrid = default_params,      # Set the model parameters to those created earlier
+                method = "xgbTree",             # Set the model to boosted trees
+                metric = 'RMSE',                # Set the loss function: Root Mean Squared Error
+                objective = "reg:squarederror")
+```
+
+
+### Model Validation
+
+Now that the model is trained, we can check the RMSE calculated during training with cross validation and compare that to the RMSE produced by making predictions on the validation set.
+
+```{r}
+# Check the CV RMSE
+cat('Cross-Validation RMSE:', sep = ' ', model1$results[['RMSE']], '\n')
+
+# Make prediction on the validation set
+preds1 <- predict(model1, test_x)
+
+# Calculate the RMSE on previously unseen data
+cat('Validation RMSE:', sep = ' ', postResample(pred = preds1, obs = test_y)["RMSE"])
+```
+
+As we can see, the two RMSEs are very similar. Now that we have a baseline of the model with default parameters, let's see if we can increase accuracy with more tuning.
+
+```{r, warning=FALSE}
+# Set the model parameters
+model_params <- expand.grid(nrounds = 550,         # More Boosting Iterations
+                            max_depth = 5,         # More Depth
+                            eta = 0.1,             # Slower learning rate
+                            gamma = 0,
+                            colsample_bytree = 1, 
+                            min_child_weight = 1,
+                            subsample = 1) 
+                                              
+
+# Train the model
+model2 <- train(Y1 ~ ., 
+                data = train,
+                trControl = control, 
+                tuneGrid = model_params, 
+                method = "xgbTree", 
+                metric = 'RMSE', 
+                objective = "reg:squarederror")
+
+# Check the CV RMSE
+cat('Cross-Validation RMSE:', sep=' ', model2$results[['RMSE']], '\n')
+
+# Make prediction on the validation set
+preds1 <- predict(model2, test_x)
+
+# Calculate the RMSE on previously unseen data
+cat('Validation RMSE:', sep=' ', postResample(pred = preds1, obs = test_y)["RMSE"])
+```
+
+As you can see, we improved the RMSE by about $2\%$ simply by changing the number of boosting iterations, tree depth, and shrinkage factor at random. While this is an improvement, there is a better way to find the optimal tuning parameters than changing them manually and refitting the model multiple times. In the next section, we will discuss three methods of tuning XGBoost models more effectively.
+
+# **Tutorial: Hyperparameter Tuning**
+
+What makes XGBoost powerful is its flexibility. We have demonstrated that we can use XGBoost to solve regression type of problems as well as classification problems. Under each use case, we can further improve our forecast accuracy by setting the right hyperparameters for the XGBoost model. The process of finding the right hyperparameters is called Hyperparameter Tuning. There are currently 3 different ways to perform hyperparameter tuning: 
+
+1. Early Stop
+2. Grid Search
+3. Bayesian Optimization 
+
+### Early Stop 
+
+The idea of Early Stop is that we can set the learning rate, `eta`, to be a relatively low value and the number of boosting iterations, `nrounds`, to be a very high value, and then, we can let XGBoost run until the evaluation metrics on the holdout data is not improving for certain number of iterations. We will usually set `nrounds` to be large enough so that we will never run into the case that the evaluation metrics on the holdout data is still improving when the number of iterations reaches `nrounds`.
+
+The advantage of using this method is that it guarantees that we will be able to find the best model based on the holdout data and the evaluation metrics we choose, as long as we set `nrounds` to be a very large number. The obvious disadvantage is that we do not know when optimal iteration will occur. It could take a long time to find the optimal settings. Another disadvantage is that this method can only tune `nrounds` and `eta`. We have to manually set up other hyperparameters like `subsample` and `max_depth`. Therefore, Early Stop is often used along with other hyperparameter tuning method like Grid Search and Bayesian Optimization. Here we will re-use the diabetes-classification data to build out a demonstration of only using Early Stop in XGBoost.
+
+```{r XGBoost HP Early Stop Set Up}
+# Data Read In
+full_data = read.csv("train.csv")
+submission_test = read.csv("test.csv")
+
+# Set the seed so our train test split is reproducible
+set.seed(1212)
+inTrain = createDataPartition(y = full_data$diabetes,
+                              p = 0.8,
+                              list = FALSE)
+
+# Training Data
+train =  as.matrix(full_data[inTrain,])
+train_x = train[,2:9] 
+train_y = train[,10, drop=FALSE]
+
+# Testing Data
+test = as.matrix(full_data[-inTrain,])
+test_x = test[,2:9]
+test_y = test[,10, drop=FALSE] 
+
+# Convert data frame to DMatrix
+dtrain = xgb.DMatrix(data = train_x, label= train_y)
+dtest = xgb.DMatrix(data = test_x, label= test_y)
+```
+ 
+What we need to do next is to build: 
+
+- `watch_list`: a watch list to compare the evaluation metrics in our training and holdout(test) data. A watch list is composed of two components. the holdout DMatrix and the training DMatrix. The holdout DMatrix should be placed at the first position because XGBoost will only use the first element in the watch list as subject to watch for Early Stop.
+- `param_list`: a list of hyperparameters that we are going to set for this model.
+
+Given the number of observations for the training data is less than 500, we are going to set the maximum depths of the tree to be 20 and the learning rate to be 0.01. 
+
+```{r XGBoost HP Early Stop}
+# Create Watch List and Parameter List
+watch_list <- list(holdout = dtest, train = dtrain)
+
+param_list <- list(
+  objective = "binary:logistic",
+  eta = 0.01,
+  max_depth = 20
+)
+```
+
+After setting up the `watch_list` and `param_list`, we will set up the Early Stop metrics within XGBoost and kick it off. You will find that we set `nrounds` to be a relatively large value. In this example, since we are working with a classification problem, we will use `logloss` as the evaluation metrics and set up a `callbacks` to call back the hyperparameters at the optimal iteration and later use them for prediction.
+
+```{r XGBoost Early Stop Modeling}
+model_early_stop <- xgb.train(
+  data = dtrain,
+  params = param_list,
+  watchlist = watch_list,
+  nrounds = 5000,
+  eval_metric = 'logloss',
+  print_every_n = 10,
+  verbose = 1,
+  callbacks = list(cb.early.stop(10, metric_name = 'holdout_logloss'))
+)
+```
+
+From the evaluation log of XGBoost, we can see that the `logloss` for the holdout data at iteration 171 is higher than that at iteration 161 (0.509711 > 0.509181). Therefore, our early stop metric was triggered and stopped the training process. The best iteration was achieved at iteration 161 and all parameters associated from that iteration are stored into the `model_early_stop` variable.
+
+
+The last step is to compare the forecast accuracy for the best iteration Early Stop found and the forecast accuracy we had previously. Since the dataset is coming from the Kaggle competition [Diabetes Classification](https://www.kaggle.com/c/diabetes-classification/overview), we will upload out results to Kaggle and compare the forecast accuracy.
+
+```{r XGBoost Early Stop Submission}
+# Subset the submission test set to only the predictors
+submission_data = as.matrix(submission_test[, 2:9])
+
+# Create predictions using out model on the submission test data
+Kaggel_pred = predict(model_early_stop, submission_data)
+Kaggel_predictions = as.numeric(Kaggel_pred > 0.5)
+
+
+# Bind the column of the subject ID and our prediction
+submission = cbind(submission_test[, 1] , Kaggel_predictions)
+colnames(submission) = c('p_id', 'diabetes')
+
+# Write the predictions to the submission.csv file
+write.csv(submission, 'submission_early_stop.csv', row.names = FALSE)
+```
+
+After uploading the submission CSV files to Kaggle, we are able to get the forecast accuracy scores. The forecast accuracy from the previous model is **0.71428**, which means that $0.71428 * 154 = 110$ of our predictions are correct. Our new XGBoost model with early stop gets **0.77272**, which means that $0.77272 * 154 = 119$ of our predictions are correct. By using Early Stop metric, we improved our forecast accuracy by $(119 - 110) / 110 \approx 8.18\%$. Overall, we can see that Early Stop works is very easy to implement within XGBoost and works very well when we do not care about the running time.  
+
+```{r Clean Up Environment 2, echo=FALSE, include=FALSE}
+rm(list = ls())
+gc()
+```
+
+### Grid Search
+
+You can think of the idea of Grid Search as a very basic brute force search with nested for loops. We first need to define the range for each hyperparameter that we are going to run through, and run the XGBoost model through every single combination of the candidate hyperparameters. Apparently, this method also requires exponential amount of time when our search grid become large, but with Grid Search, we can fine tune another hyperparameters like `max_depth`, `gamma`, `colsample_bytree`, etc. Here we are going to use the data from the regression tutorial for the Grid Search + Early Stop demonstration.
+
+```{r XGBoost Grid Search Set Up, message=FALSE, warning=FALSE}
+# Load data from CSV
+data1 <- read_csv('energy_data.csv')
+
+# Ensure X8 and X6 are factors
+data1$X8 <- as.factor(data1$X8)
+data1$X6 <- as.factor(data1$X6)
+
+# Create dummy variables
+dummies <- dummyVars(~ ., data = data1)
+data2 <- predict(dummies, newdata = data1)
+
+# Create Training Partition
+data2 <- data2 %>% as.data.frame() %>%  filter(!is.na(Y1))
+data2[is.na(data2)] <- 0
+inTrain <- createDataPartition(y = data2$Y1, p = 0.8, list = FALSE)
+
+# Training data
+train_x = data2[inTrain, 1:16] %>% as.matrix()
+train_y = data2[inTrain, 17, drop = FALSE] %>% as.matrix()
+
+# Testing Data
+test_x = data2[-inTrain, 1:16] %>% as.matrix()
+test_y = data2[-inTrain, 17, drop = FALSE] %>% as.matrix()
+
+# Convert training and testing data to XGBoost Matrix
+dtrain = xgb.DMatrix(data = train_x, label = train_y)
+dtest = xgb.DMatrix(data = test_x, label = test_y)
+```
+
+We first need to set up a Grid to store the range of hyperparameters that we want to tune. In the example below, we will continue to use Early Stop to tune `nrounds` and `eta`. We choose a relatively large `eta` for quicker runs in our tutorial. You may want to use a smaller learning rate than 0.1 in production. Here we are going to tune the `max_depth` and `colsample_bytree` as an example. 
+
+After setting up the grid, we are going to use the `apply` function to run XGBoost with Cross Validation 6 times (3 different `max_depth` x 2 different `colsample_bytree`). We will store the average Root Mean Squared Error for the test data at each run and compare the final results.
+
+```{r XGBoost Grid Search Modeling, message=FALSE}
+# Reference: https://www.kaggle.com/silverstone1903/xgboost-grid-search-r
+
+# Set the Tuning Grid 
+tune_grid <- expand.grid(nrounds = 5000,
+                         eta = 0.1,                    # Use a smaller eta for production! 
+                         max_depth =  c(10, 15, 20),   # Set max_depth to be 10, 15 and 20
+                         colsample_bytree = c(0.5, 1),
+                         gamma = c(0),
+                         min_child_weight = c(1),
+                         subsample = c(1))
+
+# Grid Search with Early Stop
+rmseHyperparameters <- apply(tune_grid, 1, function(parameterList) {
+  
+  # Extract Parameters to test
+  currentNrounds <- parameterList[["nrounds"]]
+  currentSubsampleRate <- parameterList[["subsample"]]
+  currentColsampleRate <- parameterList[["colsample_bytree"]]
+  currentDepth <- parameterList[["max_depth"]]
+  currentEta <- parameterList[["eta"]]
+  currentMinChild <- parameterList[["min_child_weight"]]
+  
+  # Initiate XGBoost with Cross Validation
+  xgboostModelCV <- xgb.cv(data =  dtrain, 
+                           nrounds = currentNrounds, 
+                           max_depth = currentDepth, 
+                           eta = currentEta,
+                           subsample = currentSubsampleRate, 
+                           colsample_bytree = currentColsampleRate, 
+                           min_child_weight = currentMinChild, 
+                           nfold = 5,
+                           objective = "reg:squarederror",
+                           booster = "gbtree",
+                           verbose = F,                                # Turning Off verbose for reporting
+                           print_every_n = 10,
+                           eval_metric = "rmse",
+                           early_stopping_rounds = 10)
+  
+  # Extract the training information from evaluation log
+  xvalidationScores <- as.data.frame(xgboostModelCV$evaluation_log)
+  test_rmse <- tail(xvalidationScores$test_rmse_mean, 1)
+  train_rmse <- tail(xvalidationScores$train_rmse_mean, 1)
+  
+  # Return the forecast accuracy and hyperparameters
+  output <- return(c(test_rmse, 
+                     train_rmse, 
+                     currentSubsampleRate, 
+                     currentColsampleRate, 
+                     currentDepth, 
+                     currentEta, 
+                     currentMinChild))})
+
+# Pivot Data and Clean Up for Display
+results <- data.frame(t(rmseHyperparameters))
+colnames(results) <- c("test_rmse", "train_rmse", "subsample", "colsample_bytree", "max_depth", "eta", "min_child_weight")
+
+# Print Out the Final Output
+results %>% arrange(test_rmse)
+```
+
+From the table above, we can see that the model with `colsample_bytree = 0.5` and `max_depth = 10` gives the smallest average RMSE and those will be the optimal hyperparameters given our model set up.
+
+### Bayesian Optimization
+
+Because Grid Search usually takes a very long to run, researchers have developed a more efficient way called Bayesian Optimization to tune the hyperparameter for XGBoost. We will not go over the mathematics behind Bayesian Optimization in this tutorial. If you are curious, you can go to this [GitHub Repo](https://github.com/AnotherSamWilson/ParBayesianOptimization) and review the code in detail. The intuition behind Bayesian Optimization is that we would use the information from the previous model evaluations to guide us in our future parameter searches [7]. We will use the Diabetes Classification data one more time for the demonstration of Bayesian Optimization with Early Stop.
+
+```{r Clean Up Environment 3, echo=FALSE, include=FALSE}
+rm(list = ls())
+gc()
+```
+
+```{r Bayesian Optimization Set Up}
+# Data Read In
+full_data = read.csv("train.csv")
+submission_test = read.csv("test.csv")
+
+# Set the seed so our train test split is reproducible
+set.seed(1212)
+inTrain = createDataPartition(y = full_data$diabetes,
+                              p = 0.8,
+                              list = FALSE)
+
+# Training Data
+train =  as.matrix(full_data[inTrain,]) #we need to save the data as matrix to later covert to a dmatrix
+train_x = train[,2:9] 
+train_y = train[,10, drop=FALSE]
+
+# Testing Data
+test = as.matrix(full_data[-inTrain,]) #we need to save the data as matrix to later covert to a dmatrix
+test_x = test[,2:9]
+test_y = test[,10, drop=FALSE] 
+
+# Convert data frame to dmatrix
+dtest = xgb.DMatrix(data = test_x, label= test_y)
+```
+
+The package we will use for Bayesian Optimization is called [`ParBayesianOptimization`](https://cran.r-project.org/web/packages/ParBayesianOptimization/ParBayesianOptimization.pdf). In this example, we will tune 3 Hyperparameters together: `max_depth`,  `min_child_weight` and `subsample`. Again, we will leave `nrounds` and `eta` to Early Stop.
+
+```{r Bayesian Optimization Functions}
+# Referenec: https://github.com/AnotherSamWilson/ParBayesianOptimization/blob/master/README.md
+
+# Create a scoring function
+# You can additional hyperparameters as argument to this function
+scoringFunction <- function(max_depth, 
+                            min_child_weight, 
+                            subsample) {
+  # Create the train DMatrix inside the function
+  # This is important because we need to re-create this DMatrix in each iteration
+  dtrain = xgb.DMatrix(data = train_x, label= train_y)
+  
+  # Create a list of parameters
+  Pars <- list(
+    booster = "gbtree",
+    eta = 0.01,
+    max_depth = round(max_depth, 0),       # XGBoost can only understand integer max_depth
+    min_child_weight = min_child_weight,
+    subsample = subsample,
+    objective = "binary:logistic",
+    eval_metric = "logloss"
+  )
+  
+  # Randomness Control
+  set.seed(666)
+
+  # XGBoost with Cross Validation and Early Stop
+  xgbcv <- xgb.cv(
+    params = Pars,
+    data = dtrain,
+    nround = 5000,
+    nfold = 5,
+    # maximize = TRUE,
+    early_stopping_rounds = 10,
+    verbose = 1
+  )
+  
+  # Return the maximum test_logloss_mean and nrounds
+  return(list(Score = max(xgbcv$evaluation_log$test_logloss_mean), nrounds = xgbcv$best_iteration))
+}
+
+# Setting Up the boundary/Search Space
+bounds <- list( 
+    max_depth = c(1, 20), 
+    min_child_weight = c(0, 5), 
+    subsample = c(0.25, 1)
+)
+```
+
+Initiate the Bayesian Optimization using the `bayesOpt` function:
+
+```{r Bayesian Optimization Modeling, warning=FALSE}
+# Randomness Control
+set.seed(666)
+
+optObj <- bayesOpt(
+  FUN = scoringFunction,
+  bounds = bounds,
+  initPoints = 4,
+  iters.n = 4, 
+  iters.k = 1
+)
+
+optObj$scoreSummary %>% arrange(Score)
+```
+Based on the Bayesian Optimization, we found that the model with `max_depth = 5`,  `min_child_weight = 2.4095277` and `subsample = 1` gives us the best log loss values. Therefore, we will use those values for our final prediction.
+```{r Bayesian Optimization Training}
+# Define the training DMatrix
+dtrain = xgb.DMatrix(data = train_x, label= train_y)
+
+# Set up a watch list for early stop
+watch_list <- list(holdout = dtest, train = dtrain)
+
+# Extract the best hyparemeters
+best_hp <- optObj$scoreSummary %>% filter(Score == min(Score))
+
+# Create a list of parameters to be passed to XGBoost 
+Pars <- list(
+  booster = "gbtree",
+  eta = 0.01,
+  max_depth = round(best_hp$max_depth, 0),
+  min_child_weight = best_hp$min_child_weight,
+  subsample = best_hp$subsample,
+  objective = "binary:logistic",
+  eval_metric = "logloss"
+)
+
+# Re-train the XGBoost model with Bayesian Optimal hyparameters and Early Stop
+model_bayes_opt_early_stop <- xgb.train(
+  data = dtrain,
+  params = Pars,
+  watchlist = watch_list,
+  nround = 5000,
+  early_stopping_rounds = 10,
+  verbose = 0,
+  callbacks = list(cb.early.stop(10, metric_name = 'holdout_logloss'))
+)
+```
+
+```{r Bayesian Optimization Prediction}
+# Subset the submission test set to only the predictors 
+submission_data = as.matrix(submission_test[,2:9])
+
+# Create predictions using out model on the submission test data
+Kaggel_pred = predict(model_bayes_opt_early_stop, submission_data)
+Kaggel_predictions = as.numeric(Kaggel_pred > 0.5)
+
+
+# Bind the column of the subject ID and our prediction 
+submission = cbind(submission_test[,1] , Kaggel_predictions)
+colnames(submission) = c('p_id','diabetes')
+
+# Write the predictions to the submission.csv file 	
+write.csv(submission, 'submission_bayes.csv', row.names=FALSE)
+```
+
+The forecast accuracy from the baseline model is **0.71428**, which means that $0.71428 * 154 = 110$ of our predictions are correct. Our new XGBoost model with Bayesian Optimization and Early Stop gives us  **0.76623**, which means that $0.76623 * 154 = 118$ of our predictions are correct. By using Early Stop metric, we improved our forecast accuracy by $(118 - 110) / 110 \approx 7.27\%$. In our Early Stop section, we were able to correctly identify 119 diabetes, which is slightly better than the 118 correct predictions we get from Bayesian Optimization and Early Stop. This is a disadvantage but an expected behavior of running the Bayesian Optimization, because sometimes we only get a sub-optimal answers within a short amount of time. One major advantage of Bayesian Optimization is its speed. Comparing to the time-consuming Grid Search method, Bayesian Optimization is dramatically faster while not sacrificing a lot of forecast accuracy. 
+
+
+##  Conclusion
+Overall, XGBoost is really powerful in solving regression and classification types of problems. Hyperparameter Tuning will always be able to help you achieve higher forecast accuracy using the same features and evaluation metric. We recommend that we should always using Early Stop for tuning the learning rate and the number of boosting iterations. As for other hyperparameters in XGBoost, we recommend the Bayesian Optimization approach for quick and good results. If time is not a constraint, we can use Grid Search to thoroughly search through the gird space. 
+
+
+
+# References
+
+[1] Chen, Tianqi, and Carlos Guestrin. “XGBoost: A Scalable Tree Boosting System.” KDD '16: Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining, 2016, pp. 784–795., doi:10.1145/2939672.2939785.
+
+[2] Hastie, Trevor, Tibshirani, Robert and Friedman, Jerome. "The Elements of Statistical Learning, Second Edition". New York, NY, USA: Springer New York Inc., 2008.
+
+[3] Porter, Michael. "SYS 6018: Data Mining". 4 Dec. 2020. https://mdporter.github.io/SYS6018/index.html
+
+[4] Atkinson, Beth. "Recursive Partitioning and Regression Trees." 12 Apr. 2019. https://www.rdocumentation.org/packages/rpart/versions/4.1-15
+
+[5] Kuhn, Max. "Building Predictive Models in R Using the caret Package." Journal of Statistical Software [Online], 28.5 (2008): 1 - 26. Web. 4 Dec. 2020
+
+[6] silverstone. “xgboost Grid Search - R” https://www.kaggle.com/silverstone1903/xgboost-grid-search-r (accessed Dec. 3, 2020)
+
+[7] S. Wilson. "Parallelizable Bayesian Optimization" https://github.com/AnotherSamWilson/ParBayesianOptimization/blob/master/README.md (accessed Dec. 3, 2020)
+
+
+
